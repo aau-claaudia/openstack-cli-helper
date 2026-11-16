@@ -1,3 +1,8 @@
+# OpenStack credentials & keys
+*openrc*.sh
+*.pem
+*.pem.pub
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
