@@ -391,86 +391,60 @@ class OpenStackClient:
         data = self._request("GET", url)
         return data.get("security_groups", [])
 
-    def ensure_ssh_security_group(self, name: str = "strato-ssh") -> str:
-        """
-        Check if an SSH-allowing security group exists; if not, create one
-        with ingress rules for TCP port 22 and ICMP (ping).
-        """
-        sgs = self.list_security_groups()
-        for sg in sgs:
-            if sg.get("name") == name:
-                return sg.get("id")
+    def delete_security_group(self, security_group_id: str) -> None:
+        """Delete a security group."""
+        url = f"{self.network_url}/v2.0/security-groups/{security_group_id}"
+        self._request("DELETE", url)
 
-        # Create security group
-        url = f"{self.network_url}/v2.0/security-groups"
-        payload = {
-            "security_group": {
-                "name": name,
-                "description": "Auto-created security group allowing SSH (port 22) and ICMP ping",
-            }
-        }
-        res = self._request("POST", url, payload=payload)
-        sg_id = res.get("security_group", {}).get("id")
+    def delete_security_group_rule(self, rule_id: str) -> None:
+        """Delete a security group rule by ID."""
+        url = f"{self.network_url}/v2.0/security-group-rules/{rule_id}"
+        self._request("DELETE", url)
 
-        # Add rule for SSH (port 22)
-        rule_url = f"{self.network_url}/v2.0/security-group-rules"
-        try:
-            self._request(
-                "POST",
-                rule_url,
-                payload={
-                    "security_group_rule": {
-                        "security_group_id": sg_id,
-                        "direction": "ingress",
-                        "ethertype": "IPv4",
-                        "protocol": "tcp",
-                        "port_range_min": 22,
-                        "port_range_max": 22,
-                        "remote_ip_prefix": "0.0.0.0/0",
-                    }
-                },
-            )
-            # Add rule for ICMP (ping)
-            self._request(
-                "POST",
-                rule_url,
-                payload={
-                    "security_group_rule": {
-                        "security_group_id": sg_id,
-                        "direction": "ingress",
-                        "ethertype": "IPv4",
-                        "protocol": "icmp",
-                        "remote_ip_prefix": "0.0.0.0/0",
-                    }
-                },
-            )
-        except Exception as e:
-            print(f"[!] Warning: Could not add security group rules: {e}")
+    def list_server_security_groups(self, server_id: str) -> list:
+        """List security groups attached to a server (with full Neutron rule details)."""
+        url = f"{self.compute_url}/servers/{server_id}/os-security-groups"
+        data = self._request("GET", url)
+        nova_sgs = data.get("security_groups", [])
+        nova_ids = {sg.get("id") for sg in nova_sgs if sg.get("id")}
+        nova_names = {sg.get("name") for sg in nova_sgs if sg.get("name")}
 
-        return sg_id
+        all_neutron_sgs = self.list_security_groups()
+        matched = [
+            sg for sg in all_neutron_sgs
+            if sg.get("id") in nova_ids or sg.get("name") in nova_names
+        ]
+        return matched if matched else nova_sgs
+
+    def add_security_group_to_server(self, server_id: str, sg_name: str) -> None:
+        """Attach an existing security group to a server."""
+        url = f"{self.compute_url}/servers/{server_id}/action"
+        payload = {"addSecurityGroup": {"name": sg_name}}
+        self._request("POST", url, payload=payload)
 
     def add_security_group_rule(
         self,
         security_group_id: str,
-        port_min: int,
-        port_max: int,
+        port_min: int = None,
+        port_max: int = None,
         protocol: str = "tcp",
         remote_ip_prefix: str = "0.0.0.0/0",
         direction: str = "ingress",
     ) -> dict:
         """Add a port or port-range rule to a security group."""
         rule_url = f"{self.network_url}/v2.0/security-group-rules"
-        payload = {
-            "security_group_rule": {
-                "security_group_id": security_group_id,
-                "direction": direction,
-                "ethertype": "IPv4",
-                "protocol": protocol.lower(),
-                "port_range_min": port_min,
-                "port_range_max": port_max,
-                "remote_ip_prefix": remote_ip_prefix,
-            }
+        rule_dict = {
+            "security_group_id": security_group_id,
+            "direction": direction,
+            "ethertype": "IPv4",
+            "protocol": protocol.lower(),
+            "remote_ip_prefix": remote_ip_prefix,
         }
+        if port_min is not None and port_max is not None and protocol.lower() != "icmp":
+            rule_dict["port_range_min"] = port_min
+            rule_dict["port_range_max"] = port_max
+
+        payload = {"security_group_rule": rule_dict}
         try:
             return self._request("POST", rule_url, payload=payload)
         except Exception as e:
@@ -479,19 +453,26 @@ class OpenStackClient:
                 return {}
             raise
 
-    def ensure_ports_security_group(self, name: str, port_rules: list) -> str:
+    def ensure_instance_security_group(
+        self,
+        instance_name: str,
+        allow_ssh: bool = True,
+        port_rules: list = None,
+    ) -> str:
         """
-        Ensure a security group exists with the specified port and port-range rules.
-        port_rules: list of (port_min, port_max, protocol)
+        Create a dedicated, isolated security group for this instance (<instance_name>-sg).
+        Guarantees that ports opened for this instance apply ONLY to this instance
+        and do not leak to other project instances.
         """
+        sg_name = f"{instance_name}-sg"
         sgs = self.list_security_groups()
-        sg = next((s for s in sgs if s.get("name") == name), None)
+        sg = next((s for s in sgs if s.get("name") == sg_name), None)
         if not sg:
             url = f"{self.network_url}/v2.0/security-groups"
             payload = {
                 "security_group": {
-                    "name": name,
-                    "description": "Auto-created security group for custom open ports and port ranges",
+                    "name": sg_name,
+                    "description": f"Dedicated isolated security group for instance '{instance_name}'",
                 }
             }
             res = self._request("POST", url, payload=payload)
@@ -499,20 +480,50 @@ class OpenStackClient:
         else:
             sg_id = sg.get("id")
 
-        for min_p, max_p, proto in port_rules:
+        # Ingress SSH (port 22) and ICMP (ping)
+        if allow_ssh:
             try:
                 self.add_security_group_rule(
                     security_group_id=sg_id,
-                    port_min=min_p,
-                    port_max=max_p,
-                    protocol=proto,
+                    port_min=22,
+                    port_max=22,
+                    protocol="tcp",
                 )
-                range_str = f"{min_p}-{max_p}" if min_p != max_p else str(min_p)
-                print(f"[+] Security rule enabled: {range_str}/{proto} (ingress)")
             except Exception as e:
-                print(f"[!] Warning: Could not add rule for {min_p}-{max_p}/{proto}: {e}")
+                print(f"[!] Warning: Could not add SSH rule to '{sg_name}': {e}")
+
+            try:
+                self.add_security_group_rule(
+                    security_group_id=sg_id,
+                    protocol="icmp",
+                )
+            except Exception as e:
+                print(f"[!] Warning: Could not add ICMP ping rule to '{sg_name}': {e}")
+
+        # Instance-specific custom ports and port ranges
+        if port_rules:
+            for min_p, max_p, proto in port_rules:
+                try:
+                    self.add_security_group_rule(
+                        security_group_id=sg_id,
+                        port_min=min_p,
+                        port_max=max_p,
+                        protocol=proto,
+                    )
+                    range_str = f"{min_p}-{max_p}" if min_p != max_p else str(min_p)
+                    print(f"[+] Security rule enabled for '{instance_name}': {range_str}/{proto} (ingress)")
+                except Exception as e:
+                    print(f"[!] Warning: Could not add rule for {min_p}-{max_p}/{proto} to '{sg_name}': {e}")
 
         return sg_id
+
+    def ensure_ssh_security_group(self, name: str = "strato-ssh") -> str:
+        """Legacy helper for backward compatibility."""
+        return self.ensure_instance_security_group(instance_name=name.replace("-ssh", ""), allow_ssh=True)
+
+    def ensure_ports_security_group(self, name: str, port_rules: list) -> str:
+        """Legacy helper for backward compatibility."""
+        return self.ensure_instance_security_group(instance_name=name.replace("-ports", ""), allow_ssh=False, port_rules=port_rules)
 
     # --------------------------------------------------------------------------
     # Server / Instance Management
@@ -1020,48 +1031,51 @@ def run_interactive_wizard(
     print("=" * 72)
 
     # 1. Instance Name
-    default_name = (
-        args.name if (args and args.name) else f"strato-vm-{datetime.datetime.now().strftime('%m%d-%H%M')}"
-    )
-    instance_name = input(f"\n[1/7] Instance Name [{default_name}]: ").strip()
-    if not instance_name:
-        instance_name = default_name
+    if args and args.name:
+        instance_name = args.name.strip()
+        print(f"\n[1/7] Instance Name: '{instance_name}' (from --name, skipping prompt)")
+    else:
+        default_name = f"strato-vm-{datetime.datetime.now().strftime('%m%d-%H%M')}"
+        instance_name = input(f"\n[1/7] Instance Name [{default_name}]: ").strip()
+        if not instance_name:
+            instance_name = default_name
 
     # 2. Select Image
-    print("\n[2/7] Fetching available Images from Glance...")
-    images = client.list_images()
-    if not images:
-        raise RuntimeError("No active images found in OpenStack project.")
-
-    # Find suggested image index if args.image provided
-    default_img_idx = 1
-    if args and args.image:
-        for idx, img in enumerate(images, 1):
-            if args.image == img.get("id") or args.image.lower() in img.get("name", "").lower():
-                default_img_idx = idx
-                break
-
-    print(f"[+] Available Images ({len(images)} found):")
-    for idx, img in enumerate(images, 1):
-        size_gb = img.get("size", 0) / (1024**3)
-        size_str = f"{size_gb:.1f} GB" if size_gb >= 0.1 else "N/A"
-        suggest_tag = " (Suggested)" if idx == default_img_idx and (args and args.image) else ""
-        print(f"    [{idx:>2}] {img.get('name')} (Min Disk: {img.get('min_disk', 0)}GB, Size: {size_str}){suggest_tag}")
-
     selected_image = None
-    while not selected_image:
-        try:
-            choice = input(f"Select Image [1-{len(images)}] (default: {default_img_idx}): ").strip()
-            if not choice:
-                choice = str(default_img_idx)
-            c_idx = int(choice) - 1
-            if 0 <= c_idx < len(images):
-                selected_image = images[c_idx]
-        except ValueError:
-            print("Please enter a valid number.")
+    if args and args.image:
+        images = client.list_images()
+        for img in images:
+            if args.image == img.get("id") or args.image.lower() in img.get("name", "").lower():
+                selected_image = img
+                print(f"\n[2/7] Image: '{selected_image.get('name')}' (from --image, skipping prompt)")
+                break
+        if not selected_image:
+            print(f"\n[2/7] Image: Specified '{args.image}' not found, displaying available images...")
+
+    if not selected_image:
+        print("\n[2/7] Fetching available Images from Glance...")
+        images = client.list_images()
+        if not images:
+            raise RuntimeError("No active images found in OpenStack project.")
+
+        print(f"[+] Available Images ({len(images)} found):")
+        for idx, img in enumerate(images, 1):
+            size_gb = img.get("size", 0) / (1024**3)
+            size_str = f"{size_gb:.1f} GB" if size_gb >= 0.1 else "N/A"
+            print(f"    [{idx:>2}] {img.get('name')} (Min Disk: {img.get('min_disk', 0)}GB, Size: {size_str})")
+
+        while not selected_image:
+            try:
+                choice = input(f"Select Image [1-{len(images)}] (default: 1): ").strip()
+                if not choice:
+                    choice = "1"
+                c_idx = int(choice) - 1
+                if 0 <= c_idx < len(images):
+                    selected_image = images[c_idx]
+            except ValueError:
+                print("Please enter a valid number.")
 
     # 3. Select Flavor (Quota-Aware: Only list flavors that fit remaining quota)
-    print("\n[3/7] Fetching compute Flavors and evaluating against quota...")
     all_flavors = client.list_flavors()
     if not all_flavors:
         raise RuntimeError("No flavors found in OpenStack.")
@@ -1077,172 +1091,181 @@ def run_interactive_wizard(
             "Please delete unused instances or request a quota increase."
         )
 
-    # Find suggested flavor index if args.flavor provided
-    default_flv_idx = 1
+    selected_flavor = None
     if args and args.flavor:
-        for idx, flv in enumerate(flavors, 1):
+        for flv in flavors:
             if args.flavor in (flv.get("id"), flv.get("name")):
-                default_flv_idx = idx
+                selected_flavor = flv
+                print(f"\n[3/7] Flavor: '{selected_flavor.get('name')}' (from --flavor, skipping prompt)")
                 break
-    else:
+        if not selected_flavor:
+            exceeded = [f for f in all_flavors if args.flavor in (f.get("id"), f.get("name"))]
+            if exceeded:
+                _, reason = quota.check_flavor(exceeded[0])
+                print(f"\n[3/7] Specified flavor '{args.flavor}' exceeds quota: {reason}")
+            else:
+                print(f"\n[3/7] Specified flavor '{args.flavor}' not found.")
+            print("[*] Please select a flavor that fits within quota from the list below.")
+
+    if not selected_flavor:
+        print("\n[3/7] Fetching compute Flavors and evaluating against quota...")
         # Default to first flavor that fits quota and has >= 1 vCPU and >= 1 GB RAM
+        default_flv_idx = 1
         for idx, flv in enumerate(flavors, 1):
             if flv.get("vcpus", 1) >= 1 and flv.get("ram", 0) >= 1024:
                 default_flv_idx = idx
                 break
 
-    exceeded_count = len(all_flavors) - len(flavors)
-    exceeded_note = f" ({exceeded_count} larger flavor(s) omitted due to quota)" if exceeded_count > 0 else ""
-    print(f"[+] Available Flavors ({len(flavors)} within quota{exceeded_note}):")
-    for idx, flv in enumerate(flavors, 1):
-        vcpus = flv.get("vcpus", 1)
-        ram_gb = flv.get("ram", 512) / 1024.0
-        disk_gb = flv.get("disk", 0)
-        suggest_tag = " (Suggested)" if idx == default_flv_idx else ""
-        print(
-            f"    [{idx:>2}] {flv.get('name'):<16} | {vcpus:>2} vCPU | {ram_gb:>4.1f} GB RAM | {disk_gb:>3} GB Disk{suggest_tag}"
-        )
+        exceeded_count = len(all_flavors) - len(flavors)
+        exceeded_note = f" ({exceeded_count} larger flavor(s) omitted due to quota)" if exceeded_count > 0 else ""
+        print(f"[+] Available Flavors ({len(flavors)} within quota{exceeded_note}):")
+        for idx, flv in enumerate(flavors, 1):
+            vcpus = flv.get("vcpus", 1)
+            ram_gb = flv.get("ram", 512) / 1024.0
+            disk_gb = flv.get("disk", 0)
+            suggest_tag = " (Suggested)" if idx == default_flv_idx else ""
+            print(
+                f"    [{idx:>2}] {flv.get('name'):<16} | {vcpus:>2} vCPU | {ram_gb:>4.1f} GB RAM | {disk_gb:>3} GB Disk{suggest_tag}"
+            )
 
-    selected_flavor = None
-    while not selected_flavor:
-        try:
-            choice = input(f"Select Flavor [1-{len(flavors)}] (default: {default_flv_idx}): ").strip()
-            if not choice:
-                choice = str(default_flv_idx)
-            c_idx = int(choice) - 1
-            if 0 <= c_idx < len(flavors):
-                selected_flavor = flavors[c_idx]
-        except ValueError:
-            print("Please enter a valid number.")
+        while not selected_flavor:
+            try:
+                choice = input(f"Select Flavor [1-{len(flavors)}] (default: {default_flv_idx}): ").strip()
+                if not choice:
+                    choice = str(default_flv_idx)
+                c_idx = int(choice) - 1
+                if 0 <= c_idx < len(flavors):
+                    selected_flavor = flavors[c_idx]
+            except ValueError:
+                print("Please enter a valid number.")
 
     # 4. Select Network
-    print("\n[4/7] Fetching project networks...")
     networks = client.list_networks()
     tenant_nets = [n for n in networks if not n.get("router:external")]
     ext_nets = [n for n in networks if n.get("router:external")]
 
-    # If no separate private tenant network exists
-    if not tenant_nets:
-        if networks:
-            # All available networks have router:external flag or are shared provider networks
-            print(f"[*] Found {len(networks)} network(s) available in project:")
-            for idx, n in enumerate(networks, 1):
-                ext_str = "External/Public" if n.get("router:external") else "Internal"
-                print(f"    [{idx}] {n.get('name')} ({ext_str}, ID: {n.get('id')})")
-
-            create_choice = input(
-                "\nCreate a dedicated private network ('strato-net') with router? [y/N]: "
-            ).strip().lower()
-            if create_choice == "y":
-                ext_id = ext_nets[0].get("id") if ext_nets else None
-                new_net = client.auto_create_network_topology(ext_net_id=ext_id)
-                tenant_nets = [new_net]
-            else:
-                tenant_nets = list(networks)
-        else:
-            # No networks exist at all in project
-            print("[!] No networks found in your OpenStack project.")
-            print("[*] OpenStack instances require a virtual network interface.")
-            create_choice = input(
-                "Automatically create a private network ('strato-net') with subnet and router? [Y/n]: "
-            ).strip().lower()
-            if create_choice != "n":
-                ext_id = ext_nets[0].get("id") if ext_nets else None
-                new_net = client.auto_create_network_topology(ext_net_id=ext_id)
-                tenant_nets = [new_net]
-            else:
-                raise RuntimeError("Cannot create instance without an available network.")
-
     selected_network = None
-    if len(tenant_nets) == 1:
-        selected_network = tenant_nets[0]
-        print(f"[*] Automatically selecting network: {selected_network.get('name')}")
-    else:
-        print("[+] Available Networks:")
-        for idx, net in enumerate(tenant_nets, 1):
-            ext_tag = " [External/Public]" if net.get("router:external") else ""
-            print(f"    [{idx}] {net.get('name')}{ext_tag} (ID: {net.get('id')})")
-        while not selected_network:
-            try:
-                choice = input(f"Select Network [1-{len(tenant_nets)}] (default: 1): ").strip()
-                if not choice:
-                    choice = "1"
-                c_idx = int(choice) - 1
-                if 0 <= c_idx < len(tenant_nets):
-                    selected_network = tenant_nets[c_idx]
-            except ValueError:
-                print("Please enter a valid number.")
+    if args and args.network:
+        for net in networks:
+            if args.network in (net.get("id"), net.get("name")):
+                selected_network = net
+                print(f"\n[4/7] Network: '{selected_network.get('name')}' (from --network, skipping prompt)")
+                break
+        if not selected_network:
+            print(f"[!] Warning: Specified network '{args.network}' not found.")
+
+    if not selected_network:
+        print("\n[4/7] Fetching project networks...")
+        available_nets = tenant_nets if tenant_nets else list(networks)
+        if not available_nets:
+            raise RuntimeError("No existing networks found in your OpenStack project.")
+
+        if len(available_nets) == 1:
+            selected_network = available_nets[0]
+            print(f"[*] Automatically selecting network: {selected_network.get('name')}")
+        else:
+            print("[+] Available Networks:")
+            for idx, net in enumerate(available_nets, 1):
+                ext_tag = " [External/Public]" if net.get("router:external") else ""
+                print(f"    [{idx}] {net.get('name')}{ext_tag} (ID: {net.get('id')})")
+            while not selected_network:
+                try:
+                    choice = input(f"Select Network [1-{len(available_nets)}] (default: 1): ").strip()
+                    if not choice:
+                        choice = "1"
+                    c_idx = int(choice) - 1
+                    if 0 <= c_idx < len(available_nets):
+                        selected_network = available_nets[c_idx]
+                except ValueError:
+                    print("Please enter a valid number.")
 
     # 5. SSH Keypair
-    print("\n[5/7] Configuring SSH Keypair...")
-    key_name, local_key_path = resolve_or_create_ssh_key(
-        client,
-        requested_key_name=args.key_name if args else None,
-        custom_key_path=args.key_file if args else None,
-        interactive=True,
-    )
+    if args and args.key_name:
+        key_name, local_key_path = resolve_or_create_ssh_key(
+            client,
+            requested_key_name=args.key_name,
+            custom_key_path=args.key_file if args else None,
+            interactive=False,
+        )
+        print(f"\n[5/7] SSH Keypair: '{key_name}' (from --key-name, skipping prompt)")
+    else:
+        print("\n[5/7] Configuring SSH Keypair...")
+        key_name, local_key_path = resolve_or_create_ssh_key(
+            client,
+            requested_key_name=None,
+            custom_key_path=args.key_file if args else None,
+            interactive=True,
+        )
 
     # 6. Security Group & Ingress Ports
     print("\n[6/7] Configuring Security Groups & Ingress Ports...")
     sgs = client.list_security_groups()
     default_sg = next((sg for sg in sgs if sg.get("name") == "default"), None)
-    sg_name = (
+    base_sg_name = (
         (args.secgroup if args and args.secgroup else None)
         or (default_sg.get("name") if default_sg else (sgs[0].get("name") if sgs else "default"))
     )
-    print(f"[*] Base security group: '{sg_name}'")
+    print(f"[*] Base security group: '{base_sg_name}'")
     ensure_ssh = input("Ensure SSH (port 22) and ICMP (ping) ingress rules are enabled? [Y/n]: ").strip().lower()
-    selected_sgs = [sg_name]
-    if ensure_ssh != "n":
-        ssh_sg_id = client.ensure_ssh_security_group("strato-ssh")
-        if "strato-ssh" not in selected_sgs:
-            selected_sgs.append("strato-ssh")
+    allow_ssh = ensure_ssh != "n"
 
     # Ingress Port / Port Range configuration
-    default_ports = args.ports if (args and args.ports) else ""
-    port_prompt = (
-        f"Additional port(s) or port range(s) to open [{default_ports}]: "
-        if default_ports
-        else "Additional port(s) or port range(s) to open (e.g. '80, 443, 8000-8080', or Enter for none): "
-    )
-    raw_ports = input(port_prompt).strip()
-    if not raw_ports and default_ports:
-        raw_ports = default_ports
+    port_rules = []
+    if args and args.ports:
+        raw_ports = args.ports
+        print(f"[*] Ingress Ports: '{raw_ports}' (from --ports, skipping prompt)")
+    else:
+        port_prompt = "Additional port(s) or port range(s) to open (e.g. '80, 443, 8000-8080', or Enter for none): "
+        raw_ports = input(port_prompt).strip()
 
-    configured_ports = []
     if raw_ports:
         try:
             port_rules = parse_port_specs(raw_ports)
-            if port_rules:
-                client.ensure_ports_security_group("strato-ports", port_rules)
-                if "strato-ports" not in selected_sgs:
-                    selected_sgs.append("strato-ports")
-                configured_ports = [
-                    f"{p_min}-{p_max}/{proto}" if p_min != p_max else f"{p_min}/{proto}"
-                    for p_min, p_max, proto in port_rules
-                ]
         except Exception as e:
-            print(f"[!] Warning: Could not configure custom ports: {e}")
+            print(f"[!] Warning: Could not parse ports '{raw_ports}': {e}")
+
+    # Build dedicated instance security group if SSH or custom ports are enabled
+    selected_sgs = [base_sg_name]
+    configured_ports = []
+    if allow_ssh or port_rules:
+        inst_sg_name = f"{instance_name}-sg"
+        client.ensure_instance_security_group(
+            instance_name=instance_name,
+            allow_ssh=allow_ssh,
+            port_rules=port_rules,
+        )
+        if inst_sg_name not in selected_sgs:
+            selected_sgs.append(inst_sg_name)
+
+        if allow_ssh:
+            configured_ports.append("22/tcp (SSH)")
+            configured_ports.append("ICMP (ping)")
+        if port_rules:
+            for p_min, p_max, proto in port_rules:
+                range_str = f"{p_min}-{p_max}" if p_min != p_max else str(p_min)
+                configured_ports.append(f"{range_str}/{proto}")
 
     # 7. Floating IP
-    print("\n[7/7] Floating (Public) IP configuration...")
     enable_fip = True
     if selected_network.get("router:external"):
         print(
-            f"[*] Note: '{selected_network.get('name')}' is an external network. Instance will receive a public IP directly."
+            f"\n[7/7] Floating IP: Note: '{selected_network.get('name')}' is an external network. Instance will receive a public IP directly."
         )
         enable_fip = False
+    elif args and args.floating_ip is not None:
+        enable_fip = args.floating_ip
+        print(f"\n[7/7] Floating IP: {'Enabled' if enable_fip else 'Disabled'} (from CLI flag, skipping prompt)")
     elif ext_nets:
-        default_fip_prompt = "Y/n" if (args and args.floating_ip is not False) else "y/N"
+        print("\n[7/7] Floating (Public) IP configuration...")
         fip_choice = input(
-            f"Allocate and attach a Public Floating IP from '{ext_nets[0].get('name')}'? [{default_fip_prompt}]: "
+            f"Allocate and attach a Public Floating IP from '{ext_nets[0].get('name')}'? [Y/n]: "
         ).strip().lower()
         if fip_choice:
             enable_fip = fip_choice == "y"
         else:
-            enable_fip = args.floating_ip if (args and args.floating_ip is not None) else True
+            enable_fip = True
     else:
-        print("[!] Note: No external floating IP network detected in project.")
+        print("\n[7/7] Note: No external floating IP network detected in project.")
         enable_fip = False
 
     # Summary
@@ -1377,25 +1400,29 @@ def resolve_one_command_params(client: OpenStackClient, quota: QuotaChecker, arg
         interactive=False,
     )
 
-    # Security Group
-    selected_sgs = [args.secgroup] if args.secgroup else ["default"]
-    # Ensure SSH access
-    ssh_sg_id = client.ensure_ssh_security_group("strato-ssh")
-    if "strato-ssh" not in selected_sgs:
-        selected_sgs.append("strato-ssh")
+    # Security Group & Dedicated Instance Firewall
+    base_sg_name = args.secgroup if args.secgroup else "default"
+    selected_sgs = [base_sg_name]
 
-    # Ingress Port / Port Range configuration
-    configured_ports = []
+    port_rules = []
     if args.ports:
         port_rules = parse_port_specs(args.ports)
-        if port_rules:
-            client.ensure_ports_security_group("strato-ports", port_rules)
-            if "strato-ports" not in selected_sgs:
-                selected_sgs.append("strato-ports")
-            configured_ports = [
-                f"{p_min}-{p_max}/{proto}" if p_min != p_max else f"{p_min}/{proto}"
-                for p_min, p_max, proto in port_rules
-            ]
+
+    # Dedicated instance-specific security group ensures ports do not leak to other VMs
+    inst_sg_name = f"{instance_name}-sg"
+    client.ensure_instance_security_group(
+        instance_name=instance_name,
+        allow_ssh=True,
+        port_rules=port_rules,
+    )
+    if inst_sg_name not in selected_sgs:
+        selected_sgs.append(inst_sg_name)
+
+    configured_ports = ["22/tcp (SSH)", "ICMP (ping)"]
+    if port_rules:
+        for p_min, p_max, proto in port_rules:
+            range_str = f"{p_min}-{p_max}" if p_min != p_max else str(p_min)
+            configured_ports.append(f"{range_str}/{proto}")
 
     # Floating IP
     if selected_network.get("router:external"):
@@ -1689,6 +1716,15 @@ def handle_delete_instance(
 
     if wait:
         client.wait_for_server_status(server_id, target_status="DELETED")
+        # Automatically clean up the dedicated instance security group
+        for sg in client.list_security_groups():
+            if sg.get("name") in (f"{server_name}-sg", f"{server_name}-ports"):
+                try:
+                    print(f"[*] Cleaning up dedicated security group '{sg.get('name')}'...")
+                    client.delete_security_group(sg.get("id"))
+                    print(f"[+] Security group '{sg.get('name')}' deleted.")
+                except Exception as e:
+                    print(f"[!] Note: Could not delete security group '{sg.get('name')}': {e}")
     else:
         print(f"[+] Delete command sent for '{server_name}'.")
 
