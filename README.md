@@ -11,9 +11,16 @@ curl --output strato-login.py https://raw.githubusercontent.com/aau-claaudia/ope
 
 Get the token and generate your `strato-openrc.sh`:
 
+For wayf:
 ```bash
 python3 -u strato-login.py
 ```
+
+For normal user:
+```bash
+python3 -u strato-login.py --normal
+```
+
 
 Load your credentials into your shell session:
 
@@ -56,7 +63,7 @@ The wizard will display your project quota, guide you through choosing an image,
 Launch an instance directly in a single command:
 
 ```bash
-python3 strato-create-instance.py --name my-vm --image "Ubuntu 24.04" --flavor m1.small --yes
+python3 strato-create-instance.py --name my-vm --image "Ubuntu 24.04" --flavor "AAU.CPU.a.1-4" --yes
 ```
 
 #### Opening Custom Ports & Port Ranges

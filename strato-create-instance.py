@@ -39,9 +39,10 @@ try:
 except ImportError:
     requests = None
 
-# Default AAU Strato Endpoints
+# Default AAU Strato Endpoints & Resources
 DEFAULT_KEYSTONE_URL = "https://strato-new.claaudia.aau.dk:5000"
 DEFAULT_RC_FILE = "strato-openrc.sh"
+DEFAULT_NETWORK_NAME = "Campus Network 02"
 
 
 # ==============================================================================
@@ -1164,15 +1165,22 @@ def run_interactive_wizard(
             selected_network = available_nets[0]
             print(f"[*] Automatically selecting network: {selected_network.get('name')}")
         else:
+            default_net_idx = 1
+            for idx, net in enumerate(available_nets, 1):
+                if net.get("name", "").lower() == DEFAULT_NETWORK_NAME.lower():
+                    default_net_idx = idx
+                    break
+
             print("[+] Available Networks:")
             for idx, net in enumerate(available_nets, 1):
                 ext_tag = " [External/Public]" if net.get("router:external") else ""
-                print(f"    [{idx}] {net.get('name')}{ext_tag} (ID: {net.get('id')})")
+                def_tag = " (Default)" if idx == default_net_idx else ""
+                print(f"    [{idx}] {net.get('name')}{ext_tag}{def_tag} (ID: {net.get('id')})")
             while not selected_network:
                 try:
-                    choice = input(f"Select Network [1-{len(available_nets)}] (default: 1): ").strip()
+                    choice = input(f"Select Network [1-{len(available_nets)}] (default: {default_net_idx}): ").strip()
                     if not choice:
-                        choice = "1"
+                        choice = str(default_net_idx)
                     c_idx = int(choice) - 1
                     if 0 <= c_idx < len(available_nets):
                         selected_network = available_nets[c_idx]
@@ -1367,18 +1375,14 @@ def resolve_one_command_params(client: OpenStackClient, quota: QuotaChecker, arg
     tenant_nets = [n for n in networks if not n.get("router:external")]
     ext_nets = [n for n in networks if n.get("router:external")]
 
-    if not tenant_nets:
-        if networks:
-            tenant_nets = list(networks)
-        else:
-            print("[*] No networks found in project. Auto-creating private network 'strato-net'...")
-            ext_id = ext_nets[0].get("id") if ext_nets else None
-            new_net = client.auto_create_network_topology(ext_net_id=ext_id)
-            tenant_nets = [new_net]
+    # Prefer active internal/tenant networks that have at least one subnet
+    usable_tenant_nets = [
+        n for n in tenant_nets if n.get("subnets") and n.get("admin_state_up", True)
+    ] or [n for n in tenant_nets if n.get("subnets")] or tenant_nets
 
     selected_network = None
     if args.network:
-        for net in tenant_nets:
+        for net in usable_tenant_nets:
             if args.network in (net.get("id"), net.get("name")):
                 selected_network = net
                 break
@@ -1390,7 +1394,30 @@ def resolve_one_command_params(client: OpenStackClient, quota: QuotaChecker, arg
         if not selected_network:
             raise ValueError(f"Network '{args.network}' not found.")
     else:
-        selected_network = tenant_nets[0]
+        default_net = next(
+            (n for n in networks if n.get("name", "").lower() == DEFAULT_NETWORK_NAME.lower()),
+            None,
+        )
+        if default_net:
+            selected_network = default_net
+        elif usable_tenant_nets:
+            selected_network = usable_tenant_nets[0]
+        else:
+            # No internal tenant network exists; try creating a private tenant network + router
+            ext_id = ext_nets[0].get("id") if ext_nets else None
+            try:
+                print("[*] No internal tenant network found. Auto-creating private network 'strato-net'...")
+                selected_network = client.auto_create_network_topology(ext_net_id=ext_id)
+            except Exception as e:
+                if networks:
+                    print(f"[!] Warning: Could not auto-create 'strato-net' ({e}). Falling back to '{networks[0].get('name')}'.")
+                    selected_network = networks[0]
+                else:
+                    raise RuntimeError(f"No usable networks found and auto-creation failed: {e}")
+
+    net_type = "External/Public" if selected_network.get("router:external") else "Internal/Tenant"
+    subnet_count = len(selected_network.get("subnets", []))
+    print(f"[*] Network: '{selected_network.get('name')}' ({net_type}, {subnet_count} subnet(s))")
 
     # SSH Keypair
     key_name, local_key_path = resolve_or_create_ssh_key(
@@ -1468,6 +1495,25 @@ def deploy_instance(client: OpenStackClient, config: dict, wait: bool = True) ->
     # Poll status until ACTIVE
     server = client.wait_for_server(server_id)
     if server.get("status") != "ACTIVE":
+        fault_msg = server.get("fault", {}).get("message", "")
+        if "network" in fault_msg.lower():
+            net = config.get("network", {})
+            net_name = net.get("name", "unknown")
+            net_id = net.get("id", "unknown")
+            is_ext = net.get("router:external", False)
+            subnets = net.get("subnets", [])
+            print(
+                f"\n[!] Network Allocation Diagnostics:\n"
+                f"    Attempted Network : {net_name} ({net_id})\n"
+                f"    External Network  : {is_ext}\n"
+                f"    Subnets Attached  : {len(subnets)}\n"
+                f"    Common causes     : (1) Network has no subnets or no free IPs,\n"
+                f"                        (2) Direct attachment to an external network is disallowed,\n"
+                f"                        (3) Neutron port/security-group quota exceeded.\n"
+                f"    Tip               : Run '--list-networks' to inspect available networks and\n"
+                f"                        specify one with '--network <name>'.\n"
+                f"    Cleanup           : python3 strato-manage-instance.py --delete {server_id} --yes"
+            )
         return server
 
     # Floating IP attachment
@@ -1915,7 +1961,8 @@ def main():
         print(f"\nAVAILABLE NETWORKS ({len(networks)}):")
         for net in networks:
             ext_tag = "External/Floating" if net.get("router:external") else "Internal/Tenant"
-            print(f"  {net.get('name'):<25} | {ext_tag:<18} | ID: {net.get('id')}")
+            subnets_cnt = len(net.get("subnets", []))
+            print(f"  {net.get('name'):<25} | {ext_tag:<18} | Subnets: {subnets_cnt:<2} | ID: {net.get('id')}")
         sys.exit(0)
 
     if args.list_keys:

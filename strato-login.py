@@ -20,6 +20,7 @@ How it works:
 
 import argparse
 import base64
+import getpass
 import json
 import os
 import re
@@ -29,6 +30,7 @@ import struct
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -405,6 +407,60 @@ def scope_token_to_project(
     return unscoped_token, {}
 
 
+def authenticate_with_password(
+    username: str,
+    password: str,
+    domain: str = "Default",
+    keystone_url: str = KEYSTONE_AUTH_URL,
+) -> str:
+    """
+    Authenticate with Keystone v3 using standard username/password credentials.
+    Returns an unscoped X-Subject-Token string.
+    """
+    url = f"{keystone_url.rstrip('/')}/v3/auth/tokens"
+    payload = {
+        "auth": {
+            "identity": {
+                "methods": ["password"],
+                "password": {
+                    "user": {
+                        "name": username,
+                        "domain": {"name": domain},
+                        "password": password,
+                    }
+                },
+            }
+        }
+    }
+    body = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+
+    if requests:
+        r = requests.post(url, json=payload, headers=headers, timeout=15)
+        if r.status_code in (200, 201):
+            token = r.headers.get("X-Subject-Token")
+            if not token:
+                raise RuntimeError("Authentication succeeded but X-Subject-Token header was missing.")
+            return token
+        elif r.status_code == 401:
+            raise RuntimeError("Invalid username, password, or domain (HTTP 401 Unauthorized).")
+        else:
+            raise RuntimeError(f"Keystone authentication failed (HTTP {r.status_code}): {r.text}")
+    else:
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                token = r.headers.get("X-Subject-Token")
+                if not token:
+                    raise RuntimeError("Authentication succeeded but X-Subject-Token header was missing.")
+                return token
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="replace")
+            if e.code == 401:
+                raise RuntimeError("Invalid username, password, or domain (HTTP 401 Unauthorized).")
+            raise RuntimeError(f"Keystone authentication failed (HTTP {e.code}): {err_body}")
+
+
 def copy_to_clipboard(text: str) -> bool:
     """Attempt copying text to the operating system clipboard."""
     # Try pbcopy (macOS)
@@ -451,6 +507,27 @@ def main():
         default=None,
     )
     parser.add_argument(
+        "--normal",
+        action="store_true",
+        help="Login with standard OpenStack username and password instead of WAYF SSO",
+    )
+    parser.add_argument(
+        "--username",
+        "-u",
+        help="OpenStack username (for --normal login)",
+        default=None,
+    )
+    parser.add_argument(
+        "--password",
+        help="OpenStack password (for --normal login; prompted securely if omitted)",
+        default=None,
+    )
+    parser.add_argument(
+        "--domain",
+        help="OpenStack user domain name for --normal login (default: Default)",
+        default="Default",
+    )
+    parser.add_argument(
         "--manual",
         action="store_true",
         help="Skip browser automation and paste X-Subject-Token manually",
@@ -482,35 +559,68 @@ def main():
 
     unscoped_token = None
 
-    if not args.manual:
-        browser_exec = find_browser_executable(args.browser)
-        if browser_exec:
+    if args.normal:
+        print("\n[*] Standard OpenStack User Authentication (--normal)")
+        username = args.username or os.environ.get("OS_USERNAME")
+        if not username:
             try:
-                unscoped_token = capture_token_via_browser(browser_exec)
-            except Exception as e:
-                print(f"[!] Browser automation failed or was cancelled: {e}")
-                print("[*] Falling back to manual token input.\n")
-        else:
-            print("[!] No supported Chromium-based browser found on your system.")
-            print("[*] Falling back to manual token input.\n")
-
-    if not unscoped_token:
-        print("\n--- Manual Token Instructions ---")
-        print("1. Open the following link in your browser:")
-        print(f"   {WAYF_SAML_AUTH_URL}")
-        print("2. Open Browser Developer Tools (F12 or right-click -> Inspect -> Network tab).")
-        print("3. Filter by 'Doc' or 'Fetch/XHR' and complete your AAU / WAYF login.")
-        print("4. Click on the 'auth' request and look under 'Response Headers' for 'X-Subject-Token'.")
-        print("5. Copy that token string and paste it below.\n")
-
-        while not unscoped_token:
-            try:
-                raw_input = input("Enter X-Subject-Token: ").strip()
-                if raw_input:
-                    unscoped_token = raw_input
+                username = input("Username: ").strip()
             except (KeyboardInterrupt, EOFError):
                 print("\nAborted.")
                 sys.exit(1)
+        if not username:
+            print("[!] Error: Username cannot be empty.")
+            sys.exit(1)
+
+        password = args.password or os.environ.get("OS_PASSWORD")
+        if not password:
+            try:
+                password = getpass.getpass("Password: ")
+            except (KeyboardInterrupt, EOFError):
+                print("\nAborted.")
+                sys.exit(1)
+        if not password:
+            print("[!] Error: Password cannot be empty.")
+            sys.exit(1)
+
+        domain = args.domain or os.environ.get("OS_USER_DOMAIN_NAME") or "Default"
+        try:
+            print(f"[*] Authenticating '{username}' (domain: '{domain}') against Keystone...")
+            unscoped_token = authenticate_with_password(username, password, domain=domain)
+            print("[+] Password authentication succeeded!")
+        except Exception as e:
+            print(f"[!] Authentication failed: {e}")
+            sys.exit(1)
+    else:
+        if not args.manual:
+            browser_exec = find_browser_executable(args.browser)
+            if browser_exec:
+                try:
+                    unscoped_token = capture_token_via_browser(browser_exec)
+                except Exception as e:
+                    print(f"[!] Browser automation failed or was cancelled: {e}")
+                    print("[*] Falling back to manual token input.\n")
+            else:
+                print("[!] No supported Chromium-based browser found on your system.")
+                print("[*] Falling back to manual token input.\n")
+
+        if not unscoped_token:
+            print("\n--- Manual Token Instructions ---")
+            print("1. Open the following link in your browser:")
+            print(f"   {WAYF_SAML_AUTH_URL}")
+            print("2. Open Browser Developer Tools (F12 or right-click -> Inspect -> Network tab).")
+            print("3. Filter by 'Doc' or 'Fetch/XHR' and complete your AAU / WAYF login.")
+            print("4. Click on the 'auth' request and look under 'Response Headers' for 'X-Subject-Token'.")
+            print("5. Copy that token string and paste it below.\n")
+
+            while not unscoped_token:
+                try:
+                    raw_input = input("Enter X-Subject-Token: ").strip()
+                    if raw_input:
+                        unscoped_token = raw_input
+                except (KeyboardInterrupt, EOFError):
+                    print("\nAborted.")
+                    sys.exit(1)
 
     print(f"\n[+] Active X-Subject-Token: {unscoped_token[:10]}...{unscoped_token[-6:]}")
 
